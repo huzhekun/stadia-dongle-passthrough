@@ -1,86 +1,81 @@
-# Stadia Controller Dongle
+# Stadia Controller USB Passthrough Dongle
 
-Presents a Google Stadia controller as an Xbox 360 gamepad over USB. The ESP32-S3
-connects to the controller via BLE and appears to the host PC as a wired Xbox 360
-controller — no drivers required on Windows, Linux, or macOS.
+Firmware for an ESP32-S3 dongle that connects to a Google Stadia Controller over
+Bluetooth LE and exposes it to the USB host as a Stadia Controller HID device.
 
-Plug the dongle into your PC, hold the Stadia button on the controller to pair, and it works.
+The USB side uses Google VID/PID `18D1:9400`, input report ID `0x03`, and output
+report ID `0x05`. The BLE side keeps ownership of the controller's HID-over-GATT
+service, so rumble is forwarded with the write-with-response behavior the Stadia
+firmware accepts.
 
 ### Why a dongle?
 
-After Google shut down Stadia, they released a firmware update enabling the controller's
-Bluetooth mode. On Windows, input works fine but **rumble does not** — and it cannot be
-fixed in software.
+After Google released the Bluetooth firmware for the Stadia Controller, normal
+input works on Windows but rumble does not. The debug work in
+`../stadia-controller-debug` found the reason: Windows' BLE HID-over-GATT driver
+rejects the Stadia output report characteristic because it advertises
+`Read | Write` but not `WriteWithoutResponse`. Windows then never registers
+output report `0x05` in its live HOGP report map, so HID output calls fail before
+any Bluetooth write happens.
 
-The root cause is a Windows kernel driver limitation: the Windows BLE HID driver holds
-exclusive access to the controller's GATT service, blocking all output reports. Neither
-`WriteFile` (returns error 87 — the BLE stack sends a write-without-response which the
-Stadia firmware rejects) nor `HidD_SetOutputReport` (fails silently) can send the rumble
-command. Direct GATT access via WinRT is also denied while the HID driver is active, and
-disabling the driver drops the Bluetooth connection entirely.
+The ESP32-S3 sidesteps that Windows limitation. It owns the BLE connection,
+subscribes to Stadia input report `0x03`, writes Stadia output report `0x05` with
+response, and presents the controller over USB.
 
-The ESP32-S3 sidesteps all of this. Its BLE stack correctly issues a GATT
-write-with-response for the rumble characteristic — exactly what the Stadia firmware
-requires. The host PC only sees a standard wired Xbox 360 controller over USB, so no
-special software or drivers are needed on the PC side at all.
+The USB device stays detached until the Bluetooth controller reaches HID-ready
+state. If the controller disconnects, the dongle soft-detaches from USB so the
+host sees the Stadia Controller disappear instead of keeping a stale gamepad.
 
 ### Hardware
 
 Any ESP32-S3 board with native USB (USB OTG on GPIO19/20). The USB port connected
 to the host must be the native USB port, not UART.
 
-### Flashing
+### Building and flashing
 
-**Easy — no software needed:** use the web installer in Chrome or Edge.
-
-👉 **[scalee.github.io/stadia-dongle](https://scalee.github.io/stadia-dongle/)**
-
-Connect the ESP32-S3 via the **COM/UART USB port**, click Install, then move it to the **native USB port** after flashing.
-
-<details>
-<summary>Building and flashing from source</summary>
-
-Requires [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/) v6.0 with target `esp32s3`.
+Requires [PlatformIO Core](https://docs.platformio.org/en/latest/core/index.html)
+or the PlatformIO VS Code extension.
 
 ```sh
-idf.py build
-idf.py -p <PORT> flash
+pio run
+pio run -t upload --upload-port <PORT>
 ```
 
-</details>
+After flashing through the COM/UART USB port, move the board to the native USB
+port for controller passthrough.
+
+The default PlatformIO environment is `esp32s3` and uses the existing ESP-IDF
+`main/` component layout. A successful build also writes a merged web-installer
+image to:
+
+```text
+.pio/build/esp32s3/firmware-merged.bin
+```
 
 ### Pairing
 
-The dongle bonds to the first Stadia controller it sees. The bond is stored in NVS
-(flash) and survives power cycles. To pair a different controller, erase NVS:
+The dongle bonds to the first Stadia controller it sees. The bond is stored in
+NVS and survives power cycles. To pair a different controller, erase NVS:
 
 ```sh
-idf.py -p <PORT> erase-flash
+pio run -t erase --upload-port <PORT>
 ```
 
-### Button mapping
+### Battery status
 
-| Stadia          | Xbox 360     |
-|-----------------|--------------|
-| A / B / X / Y  | A / B / X / Y |
-| LB / RB        | LB / RB      |
-| LT / RT        | LT / RT      |
-| LS / RS        | LS / RS      |
-| Menu           | Start        |
-| Options        | Back         |
-| Stadia button  | Guide        |
-| D-pad          | D-pad        |
+The dongle reads the controller's BLE Battery Service (`0x180F` / `0x2A19`) after
+the HID connection is ready. Battery updates are emitted on the USB vendor
+interface as a 4-byte packet:
 
-Rumble is fully supported in both directions.
+```text
+42 41 54 <percent>
+```
 
-### Assistant button — hold 3 s
-
-Hold the Assistant button for 3 seconds to toggle rumble on/off. A short haptic
-pattern confirms the state change.
+The first three bytes are ASCII `BAT`; `<percent>` is `0..100`, or `0xFF` when
+unknown/disconnected. A host can also write `42 41 54 3F` (`BAT?`) to the vendor
+OUT endpoint to request the cached value.
 
 ### Debug logging
 
-In `bridge.h`, set `DONGLE_DEBUG 1` to enable raw HID report hex dumps over UART.
-Set to `0` for production builds.
-
----
+In `main/bridge.h`, set `DONGLE_DEBUG 1` to enable raw HID report hex dumps over
+UART. Set it to `0` for production builds.

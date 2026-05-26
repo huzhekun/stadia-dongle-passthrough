@@ -1,11 +1,11 @@
 /*
- * main.c — app_main for the Stadia BT dongle.
+ * main.c - app_main for the Stadia BT dongle.
  *
  * Task layout:
- *   Core 0, pri 5 — nimble_host_task    (NimBLE host stack, via nimble_port_freertos_init)
- *   Core 0, pri 3 — ble_rumble_task     (drain usb_to_ble → ble_central_send_rumble)
- *   Core 1, pri 4 — tinyusb device task (created internally by tinyusb_driver_install)
- *   Core 1, pri 4 — usb_xbox_task       (drain ble_to_usb → xbox_send_report)
+ *   Core 0, pri 5 - nimble_host_task    (NimBLE host stack)
+ *   Core 0, pri 3 - ble_rumble_task     (drain usb_to_ble -> BLE rumble)
+ *   Core 1, pri 4 - tinyusb device task (created by tinyusb_driver_install)
+ *   Core 1, pri 4 - usb_stadia_task     (drain ble_to_usb -> Stadia HID)
  */
 
 #include "freertos/FreeRTOS.h"
@@ -16,12 +16,12 @@
 #include "nimble/nimble_port_freertos.h"
 
 #include "bridge.h"
-#include "usb_xbox.h"
+#include "usb_stadia.h"
 #include "ble_central.h"
 
 static const char *TAG = "MAIN";
 
-/* ---- Rumble relay task (Core 0 — same core as NimBLE) ------------------- */
+/* ---- Rumble relay task (Core 0, same core as NimBLE) -------------------- */
 
 static void ble_rumble_task(void *arg)
 {
@@ -45,24 +45,20 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Create inter-task queues
     bridge_init();
 
     // USB: install TinyUSB driver (also starts the USB device task on Core 1)
-    usb_xbox_init();
+    usb_stadia_init();
 
-    // Initialise NimBLE port (controller + host transport) before ble_central_init()
-    // so that nimble_port_get_dflt_eventq() returns a valid queue.
+    // Initialise NimBLE port before ble_central_init(), so the default event
+    // queue exists before we attach BLE callouts to it.
     nimble_port_init();
 
-    // BLE: configure NimBLE host (callbacks, pairing params, callouts)
     ble_central_init();
 
-    // Spawn tasks
-    xTaskCreatePinnedToCore(usb_xbox_task,   "usb_xbox",   4096, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(usb_stadia_task, "usb_stadia", 4096, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(ble_rumble_task, "ble_rumble", 4096, NULL, 3, NULL, 0);
 
-    // Start NimBLE host task on Core 0 (priority 5, managed by nimble_port)
     nimble_port_freertos_init(nimble_host_task);
 
     ESP_LOGI(TAG, "Stadia BT dongle started");

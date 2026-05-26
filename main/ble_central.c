@@ -21,6 +21,7 @@
 
 #include "ble_central.h"
 #include "bridge.h"
+#include "usb_stadia.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -46,6 +47,10 @@ static uint16_t g_hid_svc_end       = 0;
 static uint16_t g_input_val_handle  = 0;
 static uint16_t g_output_val_handle = 0;
 static uint16_t g_input_cccd_handle = 0;
+static uint16_t g_battery_svc_start = 0;
+static uint16_t g_battery_svc_end   = 0;
+static uint16_t g_battery_val_handle = 0;
+static uint16_t g_battery_cccd_handle = 0;
 
 /* ---- Discovery state ----------------------------------------------------- */
 
@@ -75,6 +80,7 @@ static esp_timer_handle_t s_reconnect_timer;
 static void start_scan(void);
 static int  gap_event_fn(struct ble_gap_event *event, void *arg);
 static void process_next_chr(void);
+static void start_battery_discovery(void);
 
 /* ---- Reconnect timer callback -------------------------------------------- */
 
@@ -144,6 +150,17 @@ static int  report_ref_fn(uint16_t conn_handle, const struct ble_gatt_error *err
                            struct ble_gatt_attr *attr, void *arg);
 static int  cccd_write_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
                            struct ble_gatt_attr *attr, void *arg);
+static int  battery_svc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                                const struct ble_gatt_svc *svc, void *arg);
+static int  battery_chr_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                                const struct ble_gatt_chr *chr, void *arg);
+static int  battery_dsc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                                uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc,
+                                void *arg);
+static int  battery_read_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                            struct ble_gatt_attr *attr, void *arg);
+static int  battery_cccd_write_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                                  struct ble_gatt_attr *attr, void *arg);
 
 /* Step 1: service discovery callback */
 static int svc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
@@ -315,9 +332,144 @@ static int cccd_write_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
 {
     if (err->status == 0) {
         ESP_LOGI(TAG, "Notifications enabled — controller ready");
+        usb_stadia_set_connected(true);
+        start_battery_discovery();
     } else {
         ESP_LOGE(TAG, "CCCD write failed: %d — forcing reconnect", err->status);
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+    return 0;
+}
+
+/* ---- Battery Service (0x180F / 0x2A19) ---------------------------------- */
+
+static void start_battery_discovery(void)
+{
+    g_battery_svc_start = 0;
+    g_battery_svc_end = 0;
+    g_battery_val_handle = 0;
+    g_battery_cccd_handle = 0;
+
+    ble_uuid16_t battery_uuid = BLE_UUID16_INIT(0x180F);
+    int rc = ble_gattc_disc_svc_by_uuid(g_conn_handle, &battery_uuid.u,
+                                         battery_svc_disc_fn, NULL);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "Battery service discovery start failed: %d", rc);
+    }
+}
+
+static int battery_svc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                               const struct ble_gatt_svc *svc, void *arg)
+{
+    if (err->status == BLE_HS_EDONE) {
+        if (g_battery_svc_start == 0) {
+            ESP_LOGW(TAG, "Battery service 0x180F not found");
+            bridge_clear_battery_level();
+            return 0;
+        }
+
+        ESP_LOGI(TAG, "Battery service: 0x%04x-0x%04x",
+                 g_battery_svc_start, g_battery_svc_end);
+        ble_gattc_disc_all_chrs(conn_handle, g_battery_svc_start,
+                                g_battery_svc_end, battery_chr_disc_fn, NULL);
+        return 0;
+    }
+
+    if (err->status != 0) {
+        ESP_LOGW(TAG, "Battery service discovery error: %d", err->status);
+        bridge_clear_battery_level();
+        return 0;
+    }
+
+    g_battery_svc_start = svc->start_handle;
+    g_battery_svc_end = svc->end_handle;
+    return 0;
+}
+
+static int battery_chr_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                               const struct ble_gatt_chr *chr, void *arg)
+{
+    if (err->status == BLE_HS_EDONE) {
+        if (g_battery_val_handle == 0) {
+            ESP_LOGW(TAG, "Battery Level characteristic 0x2A19 not found");
+            bridge_clear_battery_level();
+            return 0;
+        }
+
+        ble_gattc_read(conn_handle, g_battery_val_handle, battery_read_fn, NULL);
+        return 0;
+    }
+
+    if (err->status != 0) {
+        ESP_LOGW(TAG, "Battery characteristic discovery error: %d", err->status);
+        bridge_clear_battery_level();
+        return 0;
+    }
+
+    if (chr->uuid.u.type == BLE_UUID_TYPE_16 && chr->uuid.u16.value == 0x2A19) {
+        g_battery_val_handle = chr->val_handle;
+    }
+    return 0;
+}
+
+static int battery_dsc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                               uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc,
+                               void *arg)
+{
+    if (err->status == BLE_HS_EDONE) {
+        if (g_battery_cccd_handle != 0) {
+            uint8_t val[2] = {0x01, 0x00};
+            ble_gattc_write_flat(conn_handle, g_battery_cccd_handle,
+                                 val, sizeof(val), battery_cccd_write_fn, NULL);
+        }
+        return 0;
+    }
+
+    if (err->status != 0) {
+        ESP_LOGW(TAG, "Battery descriptor discovery error: %d", err->status);
+        return 0;
+    }
+
+    if (dsc->uuid.u.type == BLE_UUID_TYPE_16 && dsc->uuid.u16.value == 0x2902) {
+        g_battery_cccd_handle = dsc->handle;
+    }
+    return 0;
+}
+
+static int battery_read_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                           struct ble_gatt_attr *attr, void *arg)
+{
+    if (err->status != 0 || attr == NULL) {
+        ESP_LOGW(TAG, "Battery read failed: %d", err->status);
+        bridge_clear_battery_level();
+        return 0;
+    }
+
+    uint8_t level = 0xFF;
+    uint16_t len = 0;
+    if (ble_hs_mbuf_to_flat(attr->om, &level, sizeof(level), &len) == 0 && len == 1) {
+        ESP_LOGI(TAG, "Battery level: %u%%", level);
+        bridge_set_battery_level(level);
+    } else {
+        ESP_LOGW(TAG, "Battery read malformed");
+        bridge_clear_battery_level();
+    }
+
+    uint16_t dsc_start = g_battery_val_handle + 1;
+    if (dsc_start <= g_battery_svc_end) {
+        ble_gattc_disc_all_dscs(conn_handle, g_battery_val_handle,
+                                g_battery_svc_end, battery_dsc_disc_fn, NULL);
+    }
+    return 0;
+}
+
+static int battery_cccd_write_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                                 struct ble_gatt_attr *attr, void *arg)
+{
+    if (err->status == 0) {
+        ESP_LOGI(TAG, "Battery notifications enabled");
+    } else {
+        ESP_LOGW(TAG, "Battery CCCD write failed: %d", err->status);
     }
     return 0;
 }
@@ -390,6 +542,10 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
             g_input_val_handle  = 0;
             g_output_val_handle = 0;
             g_input_cccd_handle = 0;
+            g_battery_svc_start = 0;
+            g_battery_svc_end   = 0;
+            g_battery_val_handle = 0;
+            g_battery_cccd_handle = 0;
             s_chr_count         = 0;
             ESP_LOGI(TAG, "Connected (handle=%d)", g_conn_handle);
 
@@ -406,14 +562,16 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
         ESP_LOGW(TAG, "Disconnected (reason=%d), retry in 1 s",
                  event->disconnect.reason);
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        g_battery_val_handle = 0;
+        g_battery_cccd_handle = 0;
+        usb_stadia_set_connected(false);
+        bridge_clear_battery_level();
         bridge_send_neutral(); // release all buttons/axes on the USB host side
         esp_timer_stop(s_reconnect_timer); // no-op if not running; prevents INVALID_STATE
         esp_timer_start_once(s_reconnect_timer, 1000000 /* 1 s in µs */);
         break;
 
     case BLE_GAP_EVENT_NOTIFY_RX: {
-        if (event->notify_rx.attr_handle != g_input_val_handle) break;
-
         uint8_t raw[16];
         uint16_t len = 0;
         if (ble_hs_mbuf_to_flat(event->notify_rx.om, raw, sizeof(raw), &len) != 0) {
@@ -421,24 +579,32 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
             break;
         }
 
+        if (event->notify_rx.attr_handle == g_battery_val_handle) {
+            if (len == 1) {
+                ESP_LOGI(TAG, "Battery level: %u%%", raw[0]);
+                bridge_set_battery_level(raw[0]);
+            }
+            break;
+        }
+
+        if (event->notify_rx.attr_handle != g_input_val_handle) break;
+
         #if DONGLE_DEBUG
         ESP_LOG_BUFFER_HEX_LEVEL(TAG, raw, len, ESP_LOG_INFO);
         #endif
 
-        // Stadia BLE sends 10 bytes: 9-byte report + 1 trailing byte.
-        // Report ID is NOT included (stripped per HOGP spec); use bytes [0..8].
+        // Stadia BLE sends the 10-byte report payload without Report ID 0x03.
         if (len < 9) {
             ESP_LOGW(TAG, "HID report too short: len=%d", len);
             break;
         }
-        const uint8_t *stadia = raw;
 
-        uint8_t xbox[20];
-        stadia_to_xbox360(stadia, xbox);
-        if (xQueueSendToBack(ble_to_usb_queue, xbox, 0) != pdTRUE) {
-            uint8_t dummy[20];
+        uint8_t stadia_usb[11];
+        stadia_ble_to_usb_hid(raw, len, stadia_usb);
+        if (xQueueSendToBack(ble_to_usb_queue, stadia_usb, 0) != pdTRUE) {
+            uint8_t dummy[11];
             xQueueReceive(ble_to_usb_queue, dummy, 0);
-            xQueueSendToBack(ble_to_usb_queue, xbox, 0);
+            xQueueSendToBack(ble_to_usb_queue, stadia_usb, 0);
         }
         break;
     }
