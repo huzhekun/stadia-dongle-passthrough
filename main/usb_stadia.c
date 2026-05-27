@@ -1,10 +1,9 @@
 /*
- * usb_stadia.c - Stadia-compatible USB descriptors and input task.
+ * usb_stadia.c - Stadia BLE-passthrough USB descriptors and input task.
  *
- * The USB host sees a Google Stadia Controller-shaped composite device:
- *   VID:PID 18D1:9400
- *   Interface 0: vendor-specific bulk endpoints (present for descriptor parity)
- *   Interface 1: HID gamepad, input report 0x03 and output report 0x05
+ * Presents as a standard single-interface HID gamepad (VID 18D1:PID 9400)
+ * with gamepad input, rumble output, and battery level — all via HID reports.
+ * No composite device, no vendor interface, no IADs.
  */
 
 #include "usb_stadia.h"
@@ -19,6 +18,7 @@
 static const char *TAG = "USB";
 
 #define STADIA_USB_INPUT_LEN 11
+#define STADIA_BATTERY_INPUT_LEN 2
 
 static bool s_usb_attached = false;
 
@@ -26,9 +26,9 @@ static const tusb_desc_device_t s_device_desc = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
     .bcdUSB             = 0x0200,
-    .bDeviceClass       = 0xEF,
-    .bDeviceSubClass    = 0x02,
-    .bDeviceProtocol    = 0x01,
+    .bDeviceClass       = 0x00,
+    .bDeviceSubClass    = 0x00,
+    .bDeviceProtocol    = 0x00,
     .bMaxPacketSize0    = 64,
     .idVendor           = 0x18D1, // Google
     .idProduct          = 0x9400, // Stadia Controller
@@ -39,55 +39,29 @@ static const tusb_desc_device_t s_device_desc = {
     .bNumConfigurations = 1,
 };
 
-#define STADIA_CFG_LEN 80
+/*
+ * Single HID interface with:
+ *   Report ID 0x03 — gamepad input (11 bytes)
+ *   Report ID 0x05 — rumble output (5 bytes)
+ *   Report ID 0x06 — battery level input (2 bytes)
+ *
+ * Config descriptor: 9 (config) + 9 (iface) + 9 (HID) + 7 + 7 = 41 bytes
+ */
+#define STADIA_CFG_LEN 41
 
 static const uint8_t s_cfg_desc[STADIA_CFG_LEN] = {
     // Configuration Descriptor (9)
     0x09, 0x02,
     STADIA_CFG_LEN & 0xFF, STADIA_CFG_LEN >> 8,
-    0x02,       // bNumInterfaces
+    0x01,       // bNumInterfaces
     0x01,       // bConfigurationValue
     0x00,       // iConfiguration
     0x80,       // bmAttributes: bus-powered
     0xFA,       // bMaxPower: 500 mA
 
-    // Interface Association Descriptor: vendor interface (8)
-    0x08, 0x0B,
-    0x00,       // bFirstInterface
-    0x01,       // bInterfaceCount
-    0xFF,       // bFunctionClass: vendor-specific
-    0x00,       // bFunctionSubClass
-    0x00,       // bFunctionProtocol
-    0x00,       // iFunction
-
-    // Interface 0: vendor-specific bulk pipe (9)
+    // Interface 0: HID gamepad (9)
     0x09, 0x04,
     0x00,       // bInterfaceNumber
-    0x00,       // bAlternateSetting
-    0x02,       // bNumEndpoints
-    0xFF,       // bInterfaceClass
-    0x00,       // bInterfaceSubClass
-    0x00,       // bInterfaceProtocol
-    0x00,       // iInterface
-
-    // EP7 IN: Bulk, 64 bytes
-    0x07, 0x05, 0x87, 0x02, 0x40, 0x00, 0x00,
-
-    // EP7 OUT: Bulk, 64 bytes
-    0x07, 0x05, 0x07, 0x02, 0x40, 0x00, 0x00,
-
-    // Interface Association Descriptor: HID interface (8)
-    0x08, 0x0B,
-    0x01,       // bFirstInterface
-    0x01,       // bInterfaceCount
-    0x03,       // bFunctionClass: HID
-    0x00,       // bFunctionSubClass
-    0x00,       // bFunctionProtocol
-    0x00,       // iFunction
-
-    // Interface 1: HID gamepad (9)
-    0x09, 0x04,
-    0x01,       // bInterfaceNumber
     0x00,       // bAlternateSetting
     0x02,       // bNumEndpoints
     0x03,       // bInterfaceClass: HID
@@ -103,11 +77,11 @@ static const uint8_t s_cfg_desc[STADIA_CFG_LEN] = {
     0x22,       // Report descriptor
     STADIA_HID_REPORT_DESC_LEN & 0xFF, STADIA_HID_REPORT_DESC_LEN >> 8,
 
-    // EP3 IN: Interrupt, 64 bytes, 6 ms
-    0x07, 0x05, 0x83, 0x03, 0x40, 0x00, 0x06,
+    // EP1 IN: Interrupt, 64 bytes, 6 ms
+    0x07, 0x05, 0x81, 0x03, 0x40, 0x00, 0x06,
 
-    // EP3 OUT: Interrupt, 64 bytes, 6 ms
-    0x07, 0x05, 0x03, 0x03, 0x40, 0x00, 0x06,
+    // EP1 OUT: Interrupt, 64 bytes, 6 ms
+    0x07, 0x05, 0x01, 0x03, 0x40, 0x00, 0x06,
 };
 
 static const char *s_str_desc[] = {
@@ -125,6 +99,7 @@ void usb_stadia_task(void *arg)
     bool have_battery_status = false;
 
     while (1) {
+        /* --- battery status (HID report 0x06) --- */
         if (!have_battery_status && xQueueReceive(battery_to_usb_queue, battery_status, 0)) {
             have_battery_status = true;
         }
@@ -133,16 +108,16 @@ void usb_stadia_task(void *arg)
         }
         if (have_battery_status) {
             int battery_res = stadia_usb_send_battery_status(battery_status);
-            if (battery_res != 0) {
+            if (battery_res == 1) {
                 have_battery_status = false;
             }
         }
 
+        /* --- gamepad input (HID report 0x03) --- */
         if (!have_report) {
             if (!xQueueReceive(ble_to_usb_queue, report, pdMS_TO_TICKS(4))) continue;
             have_report = true;
         }
-
         while (xQueueReceive(ble_to_usb_queue, report, 0)) {
             have_report = true;
         }
@@ -183,15 +158,13 @@ void usb_stadia_init(void)
         .event_arg = NULL,
     };
     ESP_ERROR_CHECK(tinyusb_driver_install(&cfg));
-    tud_disconnect();
     s_usb_attached = false;
-    ESP_LOGI(TAG, "Stadia USB HID initialised detached (VID=18D1 PID=9400)");
+    ESP_LOGI(TAG, "Stadia USB HID initialised (VID=18D1 PID=9400)");
 }
 
 void usb_stadia_set_connected(bool connected)
 {
     if (connected == s_usb_attached) return;
-
     if (connected) {
         tud_connect();
         s_usb_attached = true;

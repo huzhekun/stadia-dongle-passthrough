@@ -1,11 +1,9 @@
 /*
  * stadia_dev.c - Custom TinyUSB class driver for Stadia-compatible USB HID.
  *
- * The BLE side receives Stadia HOGP input notifications without the Report ID.
- * The USB host sees the equivalent wired HID report, with Report ID 0x03
- * prepended. Host rumble arrives as HID Output Report ID 0x05 plus two
- * little-endian 16-bit magnitudes; BLE HOGP wants the same four payload bytes
- * written to the output Report characteristic.
+ * Single HID interface with two top-level Application Collections:
+ *   Collection 1 — gamepad (Report ID 0x03 input, Report ID 0x05 output)
+ *   Collection 2 — battery  (Report ID 0x06 input)
  */
 
 #include "stadia_dev.h"
@@ -20,17 +18,16 @@
 
 static const char *TAG = "STADIA_DEV";
 
-#define STADIA_VENDOR_ITF   0x00
-#define STADIA_VENDOR_EP_IN 0x87
-#define STADIA_VENDOR_EP_OUT 0x07
-#define STADIA_HID_ITF      0x01
-#define STADIA_EP_IN        0x83
-#define STADIA_EP_OUT       0x03
+#define STADIA_HID_ITF      0x00
+#define STADIA_EP_IN        0x81
+#define STADIA_EP_OUT       0x01
 #define STADIA_EP_SIZE      64
 #define STADIA_INPUT_LEN    11
-#define STADIA_OUTPUT_LEN   5
-#define STADIA_REPORT_INPUT 0x03
+#define STADIA_BATTERY_LEN   2
+#define STADIA_OUTPUT_LEN    5
+#define STADIA_REPORT_INPUT  0x03
 #define STADIA_REPORT_RUMBLE 0x05
+#define STADIA_REPORT_BATTERY 0x06
 
 #define HID_DESC_TYPE_HID       0x21
 #define HID_DESC_TYPE_REPORT    0x22
@@ -44,111 +41,120 @@ static const char *TAG = "STADIA_DEV";
 
 static uint8_t s_in_buf[STADIA_EP_SIZE] TU_ATTR_ALIGNED(4);
 static uint8_t s_out_buf[STADIA_EP_SIZE] TU_ATTR_ALIGNED(4);
-static uint8_t s_vendor_in_buf[STADIA_EP_SIZE] TU_ATTR_ALIGNED(4);
-static uint8_t s_vendor_out_buf[STADIA_EP_SIZE] TU_ATTR_ALIGNED(4);
 static uint8_t s_ctrl_buf[STADIA_OUTPUT_LEN] TU_ATTR_ALIGNED(4);
 static uint16_t s_ctrl_len = 0;
 static volatile bool s_rhport_ready = false;
-static volatile bool s_vendor_ready = false;
 static uint8_t s_rhport = 0;
 static uint8_t s_idle_rate = 0;
 static uint8_t s_protocol = 1;
-static uint8_t s_last_battery_status[4] = { 'B', 'A', 'T', 0xFF };
 
 /*
- * Stadia-like gamepad report descriptor derived from the local debug repo's
- * parsed HID caps:
- *   Input Report 0x03: 11 bytes total (ID + 10-byte payload)
- *   Output Report 0x05: 5 bytes total (ID + two 16-bit rumble magnitudes)
+ * HID report descriptor: real Stadia Controller gamepad (182 bytes)
+ * plus battery level collection (20 bytes) = 202 bytes total.
  */
 const uint8_t stadia_hid_report_desc[] = {
-    0x05, 0x01,        // Usage Page (Generic Desktop)
+    /* ========== Gamepad (182 bytes, exact real Stadia bytes) ========== */
+    0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
     0x09, 0x05,        // Usage (Game Pad)
     0xA1, 0x01,        // Collection (Application)
-
     0x85, 0x03,        //   Report ID (3)
-
-    0x09, 0x39,        //   Usage (Hat switch)
-    0x15, 0x00,        //   Logical Minimum (0)
+    0x05, 0x01,        //   Usage Page (Generic Desktop Ctrls)
+    0x75, 0x04,        //   Report Size (4)
+    0x95, 0x01,        //   Report Count (1)
     0x25, 0x07,        //   Logical Maximum (7)
-    0x35, 0x00,        //   Physical Minimum (0)
     0x46, 0x3B, 0x01,  //   Physical Maximum (315)
-    0x65, 0x14,        //   Unit (English Rotation, degrees)
-    0x75, 0x04,        //   Report Size (4)
-    0x95, 0x01,        //   Report Count (1)
+    0x65, 0x14,        //   Unit
+    0x09, 0x39,        //   Usage (Hat switch)
     0x81, 0x42,        //   Input (Data,Var,Abs,Null)
+    0x45, 0x00,        //   Physical Maximum (0)
     0x65, 0x00,        //   Unit (None)
-    0x75, 0x04,        //   Report Size (4)
-    0x95, 0x01,        //   Report Count (1)
-    0x81, 0x01,        //   Input (Const,Array,Abs)
-
+    0x75, 0x01,        //   Report Size (1)
+    0x95, 0x04,        //   Report Count (4)
+    0x81, 0x01,        //   Input (Const)
     0x05, 0x09,        //   Usage Page (Button)
-    0x09, 0x01,        //   Usage (Button 1)
-    0x09, 0x02,        //   Usage (Button 2)
-    0x09, 0x04,        //   Usage (Button 4)
-    0x09, 0x05,        //   Usage (Button 5)
-    0x09, 0x07,        //   Usage (Button 7)
-    0x09, 0x08,        //   Usage (Button 8)
-    0x09, 0x0E,        //   Usage (Button 14)
-    0x09, 0x0F,        //   Usage (Button 15)
-    0x09, 0x0B,        //   Usage (Button 11)
-    0x09, 0x0C,        //   Usage (Button 12)
-    0x09, 0x0D,        //   Usage (Button 13 / Stadia)
-    0x09, 0x13,        //   Usage (Button 19)
-    0x09, 0x14,        //   Usage (Button 20)
-    0x09, 0x11,        //   Usage (Button 17)
-    0x09, 0x12,        //   Usage (Button 18)
     0x15, 0x00,        //   Logical Minimum (0)
     0x25, 0x01,        //   Logical Maximum (1)
     0x75, 0x01,        //   Report Size (1)
     0x95, 0x0F,        //   Report Count (15)
+    0x09, 0x12,        //   Usage (0x12)
+    0x09, 0x11,        //   Usage (0x11)
+    0x09, 0x14,        //   Usage (0x14)
+    0x09, 0x13,        //   Usage (0x13)
+    0x09, 0x0D,        //   Usage (0x0D)
+    0x09, 0x0C,        //   Usage (0x0C)
+    0x09, 0x0B,        //   Usage (0x0B)
+    0x09, 0x0F,        //   Usage (0x0F)
+    0x09, 0x0E,        //   Usage (0x0E)
+    0x09, 0x08,        //   Usage (0x08)
+    0x09, 0x07,        //   Usage (0x07)
+    0x09, 0x05,        //   Usage (0x05)
+    0x09, 0x04,        //   Usage (0x04)
+    0x09, 0x02,        //   Usage (0x02)
+    0x09, 0x01,        //   Usage (0x01)
     0x81, 0x02,        //   Input (Data,Var,Abs)
     0x75, 0x01,        //   Report Size (1)
     0x95, 0x01,        //   Report Count (1)
-    0x81, 0x01,        //   Input (Const,Array,Abs)
-
-    0x05, 0x01,        //   Usage Page (Generic Desktop)
-    0x09, 0x30,        //   Usage (X)
-    0x09, 0x31,        //   Usage (Y)
-    0x09, 0x32,        //   Usage (Z)
-    0x09, 0x35,        //   Usage (Rz)
+    0x81, 0x01,        //   Input (Const)
+    0x05, 0x01,        //   Usage Page (Generic Desktop Ctrls)
     0x15, 0x01,        //   Logical Minimum (1)
     0x26, 0xFF, 0x00,  //   Logical Maximum (255)
+    0x09, 0x01,        //   Usage (Pointer)
+    0xA1, 0x00,        //   Collection (Physical)
+    0x09, 0x30,        //     Usage (X)
+    0x09, 0x31,        //     Usage (Y)
+    0x75, 0x08,        //     Report Size (8)
+    0x95, 0x02,        //     Report Count (2)
+    0x81, 0x02,        //     Input (Data,Var,Abs)
+    0xC0,              //   End Collection
+    0x09, 0x01,        //   Usage (Pointer)
+    0xA1, 0x00,        //   Collection (Physical)
+    0x09, 0x32,        //     Usage (Z)
+    0x09, 0x35,        //     Usage (Rz)
+    0x75, 0x08,        //     Report Size (8)
+    0x95, 0x02,        //     Report Count (2)
+    0x81, 0x02,        //     Input (Data,Var,Abs)
+    0xC0,              //   End Collection
+    0x05, 0x02,        //   Usage Page (Sim Ctrls)
     0x75, 0x08,        //   Report Size (8)
-    0x95, 0x04,        //   Report Count (4)
-    0x81, 0x02,        //   Input (Data,Var,Abs)
-
-    0x05, 0x02,        //   Usage Page (Simulation Controls)
-    0x09, 0xC4,        //   Usage (Accelerator)
+    0x95, 0x02,        //   Report Count (2)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x26, 0xFF, 0x00,  //   Logical Maximum (255)
     0x09, 0xC5,        //   Usage (Brake)
+    0x09, 0xC4,        //   Usage (Accelerator)
+    0x81, 0x02,        //   Input (Data,Var,Abs)
+    0x05, 0x0C,        //   Usage Page (Consumer)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x25, 0x01,        //   Logical Maximum (1)
+    0x09, 0xE9,        //   Usage (Volume Increment)
+    0x09, 0xEA,        //   Usage (Volume Decrement)
+    0x75, 0x01,        //   Report Size (1)
+    0x95, 0x02,        //   Report Count (2)
+    0x81, 0x02,        //   Input (Data,Var,Abs)
+    0x09, 0xCD,        //   Usage (Play/Pause)
+    0x95, 0x01,        //   Report Count (1)
+    0x81, 0x02,        //   Input (Data,Var,Abs)
+    0x95, 0x05,        //   Report Count (5)
+    0x81, 0x01,        //   Input (Const)
+    0x85, 0x05,        //   Report ID (5)
+    0x06, 0x0F, 0x00,  //   Usage Page (PID Page)
+    0x09, 0x97,        //   Usage (0x97)
+    0x75, 0x10,        //   Report Size (16)
+    0x95, 0x02,        //   Report Count (2)
+    0x27, 0xFF, 0xFF, 0x00, 0x00, // Logical Maximum (65535)
+    0x91, 0x02,        //   Output (Data,Var,Abs)
+    0xC0,              // End Collection
+
+    /* ========== Battery level (20 bytes — separate Application Collection) ========== */
+    0x05, 0x06,        // Usage Page (Generic Device Controls)
+    0x09, 0x20,        // Usage (Battery Strength)  ← collection purpose
+    0xA1, 0x01,        // Collection (Application)
+    0x85, 0x06,        //   Report ID (6)
     0x15, 0x00,        //   Logical Minimum (0)
     0x26, 0xFF, 0x00,  //   Logical Maximum (255)
     0x75, 0x08,        //   Report Size (8)
-    0x95, 0x02,        //   Report Count (2)
-    0x81, 0x02,        //   Input (Data,Var,Abs)
-
-    0x05, 0x0C,        //   Usage Page (Consumer)
-    0x09, 0xEA,        //   Usage (Volume Down)
-    0x09, 0xE9,        //   Usage (Volume Up)
-    0x09, 0xCD,        //   Usage (Play/Pause)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x25, 0x01,        //   Logical Maximum (1)
-    0x75, 0x01,        //   Report Size (1)
-    0x95, 0x03,        //   Report Count (3)
-    0x81, 0x02,        //   Input (Data,Var,Abs)
-    0x75, 0x05,        //   Report Size (5)
     0x95, 0x01,        //   Report Count (1)
-    0x81, 0x01,        //   Input (Const,Array,Abs)
-
-    0x05, 0x0F,        //   Usage Page (Physical Interface)
-    0x09, 0x97,        //   Usage (DC Enable Actuators)
-    0x85, 0x05,        //   Report ID (5)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x27, 0xFF, 0xFF, 0x00, 0x00, // Logical Maximum (65535)
-    0x75, 0x10,        //   Report Size (16)
-    0x95, 0x02,        //   Report Count (2)
-    0x91, 0x02,        //   Output (Data,Var,Abs)
-
+    0x09, 0x20,        //   Usage (Battery Strength)  ← for the data item
+    0x81, 0x02,        //   Input (Data,Var,Abs)
     0xC0,              // End Collection
 };
 
@@ -190,56 +196,6 @@ static void stadia_reset(uint8_t rhport)
 {
     (void)rhport;
     s_rhport_ready = false;
-}
-
-static void stadia_vendor_init(void) {}
-static bool stadia_vendor_deinit(void) { s_vendor_ready = false; return true; }
-static void stadia_vendor_reset(uint8_t rhport) { (void)rhport; s_vendor_ready = false; }
-
-static uint16_t stadia_vendor_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc,
-                                   uint16_t max_len)
-{
-    if (itf_desc->bInterfaceClass != TUSB_CLASS_VENDOR_SPECIFIC ||
-        itf_desc->bInterfaceNumber != STADIA_VENDOR_ITF) {
-        return 0;
-    }
-
-    uint16_t const drv_len = (uint16_t)(sizeof(tusb_desc_interface_t)
-                             + itf_desc->bNumEndpoints * sizeof(tusb_desc_endpoint_t));
-    TU_VERIFY(max_len >= drv_len, 0);
-
-    uint8_t const *p_desc = tu_desc_next(itf_desc);
-    uint8_t found = 0;
-    while (found < itf_desc->bNumEndpoints && p_desc < ((uint8_t const *)itf_desc + max_len)) {
-        if (tu_desc_type(p_desc) == TUSB_DESC_ENDPOINT) {
-            tusb_desc_endpoint_t const *ep = (tusb_desc_endpoint_t const *)p_desc;
-            TU_ASSERT(usbd_edpt_open(rhport, ep), 0);
-
-            if (ep->bEndpointAddress == STADIA_VENDOR_EP_OUT) {
-                if (usbd_edpt_claim(rhport, STADIA_VENDOR_EP_OUT)) {
-                    if (!usbd_edpt_xfer(rhport, STADIA_VENDOR_EP_OUT,
-                                        s_vendor_out_buf, STADIA_EP_SIZE)) {
-                        usbd_edpt_release(rhport, STADIA_VENDOR_EP_OUT);
-                    }
-                }
-            }
-            found++;
-        }
-        p_desc = tu_desc_next(p_desc);
-    }
-
-    s_vendor_ready = true;
-    ESP_LOGI(TAG, "Opened vendor interface (%u bytes claimed)", drv_len);
-    return drv_len;
-}
-
-static bool stadia_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
-                                          tusb_control_request_t const *request)
-{
-    (void)rhport;
-    (void)stage;
-    (void)request;
-    return true;
 }
 
 static uint16_t stadia_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc,
@@ -323,6 +279,13 @@ static bool stadia_control_xfer_cb(uint8_t rhport, uint8_t stage,
 
     switch (request->bRequest) {
     case HID_REQ_GET_REPORT: {
+        uint8_t report_id = (uint8_t)request->wValue;
+        if (report_id == STADIA_REPORT_BATTERY) {
+            static uint8_t no_battery[STADIA_BATTERY_LEN] = { STADIA_REPORT_BATTERY, 0xFF };
+            uint16_t len = request->wLength < sizeof(no_battery)
+                         ? request->wLength : sizeof(no_battery);
+            return tud_control_xfer(rhport, request, no_battery, len);
+        }
         static uint8_t neutral[STADIA_INPUT_LEN] = {
             STADIA_REPORT_INPUT, 0x08, 0x00, 0x00, 0x80, 0x80,
             0x80, 0x80, 0x00, 0x00, 0x00
@@ -354,10 +317,6 @@ static bool stadia_control_xfer_cb(uint8_t rhport, uint8_t stage,
 static bool stadia_xfer_cb(uint8_t rhport, uint8_t ep_addr,
                            xfer_result_t result, uint32_t xferred_bytes)
 {
-    #if DONGLE_DEBUG
-    ESP_LOGI(TAG, "xfer_cb ep=0x%02x result=%d bytes=%lu",
-             ep_addr, result, (unsigned long)xferred_bytes);
-    #endif
     (void)result;
 
     if (ep_addr == STADIA_EP_OUT) {
@@ -376,60 +335,22 @@ static bool stadia_xfer_cb(uint8_t rhport, uint8_t ep_addr,
     return true;
 }
 
-static bool stadia_vendor_xfer_cb(uint8_t rhport, uint8_t ep_addr,
-                                  xfer_result_t result, uint32_t xferred_bytes)
-{
-    (void)result;
-    (void)xferred_bytes;
-
-    if (ep_addr == STADIA_VENDOR_EP_OUT) {
-        if (xferred_bytes >= 4 &&
-            s_vendor_out_buf[0] == 'B' &&
-            s_vendor_out_buf[1] == 'A' &&
-            s_vendor_out_buf[2] == 'T' &&
-            s_vendor_out_buf[3] == '?') {
-            stadia_usb_send_battery_status(s_last_battery_status);
-        }
-
-        if (usbd_edpt_claim(rhport, STADIA_VENDOR_EP_OUT)) {
-            if (!usbd_edpt_xfer(rhport, STADIA_VENDOR_EP_OUT,
-                                s_vendor_out_buf, STADIA_EP_SIZE)) {
-                usbd_edpt_release(rhport, STADIA_VENDOR_EP_OUT);
-            }
-        }
-    }
-    return true;
-}
-
-static usbd_class_driver_t const s_stadia_drivers[] = {
-    {
-        .name            = "STADIA_VENDOR",
-        .init            = stadia_vendor_init,
-        .deinit          = stadia_vendor_deinit,
-        .reset           = stadia_vendor_reset,
-        .open            = stadia_vendor_open,
-        .control_xfer_cb = stadia_vendor_control_xfer_cb,
-        .xfer_cb         = stadia_vendor_xfer_cb,
-        .xfer_isr        = NULL,
-        .sof             = NULL,
-    },
-    {
-        .name            = "STADIA",
-        .init            = stadia_init,
-        .deinit          = stadia_deinit,
-        .reset           = stadia_reset,
-        .open            = stadia_open,
-        .control_xfer_cb = stadia_control_xfer_cb,
-        .xfer_cb         = stadia_xfer_cb,
-        .xfer_isr        = NULL,
-        .sof             = NULL,
-    },
+static usbd_class_driver_t const s_stadia_driver = {
+    .name            = "STADIA",
+    .init            = stadia_init,
+    .deinit          = stadia_deinit,
+    .reset           = stadia_reset,
+    .open            = stadia_open,
+    .control_xfer_cb = stadia_control_xfer_cb,
+    .xfer_cb         = stadia_xfer_cb,
+    .xfer_isr        = NULL,
+    .sof             = NULL,
 };
 
 usbd_class_driver_t const *usbd_app_driver_get_cb(uint8_t *driver_count)
 {
-    *driver_count = 2;
-    return s_stadia_drivers;
+    *driver_count = 1;
+    return &s_stadia_driver;
 }
 
 int stadia_usb_send_report(const uint8_t *report)
@@ -450,16 +371,16 @@ int stadia_usb_send_report(const uint8_t *report)
 
 int stadia_usb_send_battery_status(const uint8_t *status)
 {
-    memcpy(s_last_battery_status, status, 4);
+    /* status[3] = battery percentage (0xFF = unavailable) */
+    if (!tud_connected() || !s_rhport_ready) return -1;
+    if (usbd_edpt_busy(s_rhport, STADIA_EP_IN)) return 0;
 
-    if (!tud_connected() || !s_vendor_ready) return -1;
-    if (usbd_edpt_busy(s_rhport, STADIA_VENDOR_EP_IN)) return 0;
-
-    memcpy(s_vendor_in_buf, status, 4);
-    if (usbd_edpt_claim(s_rhport, STADIA_VENDOR_EP_IN)) {
-        bool ok = usbd_edpt_xfer(s_rhport, STADIA_VENDOR_EP_IN, s_vendor_in_buf, 4);
+    uint8_t report[STADIA_BATTERY_LEN] = { STADIA_REPORT_BATTERY, status[3] };
+    memcpy(s_in_buf, report, STADIA_BATTERY_LEN);
+    if (usbd_edpt_claim(s_rhport, STADIA_EP_IN)) {
+        bool ok = usbd_edpt_xfer(s_rhport, STADIA_EP_IN, s_in_buf, STADIA_BATTERY_LEN);
         if (!ok) {
-            usbd_edpt_release(s_rhport, STADIA_VENDOR_EP_IN);
+            usbd_edpt_release(s_rhport, STADIA_EP_IN);
         }
         return ok ? 1 : 0;
     }

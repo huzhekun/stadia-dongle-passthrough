@@ -15,6 +15,19 @@ CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096
 CONFIG_TINYUSB_ENABLED=y
 CONFIG_TINYUSB_VENDOR_COUNT=0
 
+# Override Espressif's default VID/PID with Stadia Controller identifiers.
+# When these are enabled, the ESP-IDF TinyUSB wrapper ignores the custom
+# device descriptor and substitutes Espressif (303A) VID/PID — causing
+# Windows to fail with "device cannot start (Code 10)" since the Stadia
+# driver won't match.
+CONFIG_TINYUSB_DESC_USE_ESPRESSIF_VID=n
+CONFIG_TINYUSB_DESC_USE_DEFAULT_PID=n
+CONFIG_TINYUSB_DESC_CUSTOM_VID=0x18D1
+CONFIG_TINYUSB_DESC_CUSTOM_PID=0x9400
+CONFIG_TINYUSB_DESC_MANUFACTURER_STRING="Google Inc."
+CONFIG_TINYUSB_DESC_PRODUCT_STRING="Stadia Controller"
+CONFIG_TINYUSB_DESC_SERIAL_STRING="ESP32STADIA001"
+
 # Flash layout used by the web installer merged image
 CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
