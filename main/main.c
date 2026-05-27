@@ -12,6 +12,7 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
+#include "driver/gpio.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 
@@ -33,10 +34,33 @@ static void ble_rumble_task(void *arg)
     }
 }
 
+#define NVS_RESET_GPIO GPIO_NUM_0   // BOOT button on ESP32-S3 devkits
+
 /* ---- Entry point --------------------------------------------------------- */
 
 void app_main(void)
 {
+    // Check for NVS reset request: hold BOOT (GPIO0) low at power-on
+    gpio_config_t io_conf = {
+        .pin_bit_mask = BIT64(NVS_RESET_GPIO),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    if (gpio_get_level(NVS_RESET_GPIO) == 0) {
+        ESP_LOGW("MAIN", "BOOT button held — erasing NVS (all BLE bonds cleared)");
+        nvs_flash_erase();
+        // Wait for button release to avoid re-triggering
+        while (gpio_get_level(NVS_RESET_GPIO) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        ESP_LOGI("MAIN", "NVS erased, continuing boot");
+    }
+
     // NVS is required for BLE bonding persistence
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {

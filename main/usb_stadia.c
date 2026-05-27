@@ -21,6 +21,7 @@ static const char *TAG = "USB";
 #define STADIA_BATTERY_INPUT_LEN 2
 
 static bool s_usb_attached = false;
+static volatile bool s_disconnect_pending = false;  // cross-core flag
 
 static const tusb_desc_device_t s_device_desc = {
     .bLength            = sizeof(tusb_desc_device_t),
@@ -99,43 +100,72 @@ void usb_stadia_task(void *arg)
     bool have_battery_status = false;
 
     while (1) {
+        /* --- Handle pending disconnect (cross-core safe) --- */
+        if (s_disconnect_pending) {
+            /* Drain remaining reports before disconnecting so the host
+             * sees a clean neutral state instead of stuck buttons. */
+            while (xQueueReceive(ble_to_usb_queue, report, 0)) {
+                have_report = true;
+            }
+            if (have_report && s_usb_attached && s_disconnect_pending) {
+                stadia_usb_send_report(report);
+            }
+            have_report = false;
+
+            /* Drain battery queue too */
+            while (xQueueReceive(battery_to_usb_queue, battery_status, 0)) {}
+            have_battery_status = false;
+
+            /* Now disconnect — USB task owns this path, no cross-core race */
+            if (s_usb_attached) {
+                tud_disconnect();
+                s_usb_attached = false;
+                ESP_LOGI(TAG, "USB Stadia device detached");
+            }
+            s_disconnect_pending = false;
+        }
+
         /* --- battery status (HID report 0x06) --- */
-        if (!have_battery_status && xQueueReceive(battery_to_usb_queue, battery_status, 0)) {
-            have_battery_status = true;
-        }
-        while (xQueueReceive(battery_to_usb_queue, battery_status, 0)) {
-            have_battery_status = true;
-        }
-        if (have_battery_status) {
-            int battery_res = stadia_usb_send_battery_status(battery_status);
-            if (battery_res == 1) {
-                have_battery_status = false;
+        if (!s_disconnect_pending) {
+            if (!have_battery_status && xQueueReceive(battery_to_usb_queue, battery_status, 0)) {
+                have_battery_status = true;
+            }
+            while (xQueueReceive(battery_to_usb_queue, battery_status, 0)) {
+                have_battery_status = true;
+            }
+            if (have_battery_status) {
+                int battery_res = stadia_usb_send_battery_status(battery_status);
+                if (battery_res == 1) {
+                    have_battery_status = false;
+                }
             }
         }
 
         /* --- gamepad input (HID report 0x03) --- */
-        if (!have_report) {
-            if (!xQueueReceive(ble_to_usb_queue, report, pdMS_TO_TICKS(4))) continue;
-            have_report = true;
-        }
-        while (xQueueReceive(ble_to_usb_queue, report, 0)) {
-            have_report = true;
-        }
+        if (!s_disconnect_pending) {
+            if (!have_report) {
+                if (!xQueueReceive(ble_to_usb_queue, report, pdMS_TO_TICKS(4))) continue;
+                have_report = true;
+            }
+            while (xQueueReceive(ble_to_usb_queue, report, 0)) {
+                have_report = true;
+            }
 
-        int res = stadia_usb_send_report(report);
-        if (res == 1) {
-            #if DONGLE_DEBUG
-            ESP_LOG_BUFFER_HEX_LEVEL(TAG, report, STADIA_USB_INPUT_LEN, ESP_LOG_INFO);
-            #endif
-            have_report = false;
-        } else if (res == -1) {
-            have_report = false;
-            vTaskDelay(pdMS_TO_TICKS(10));
-        } else {
-            #if DONGLE_DEBUG
-            ESP_LOGW(TAG, "EP busy, retrying");
-            #endif
-            vTaskDelay(pdMS_TO_TICKS(2));
+            int res = stadia_usb_send_report(report);
+            if (res == 1) {
+                #if DONGLE_DEBUG
+                ESP_LOG_BUFFER_HEX_LEVEL(TAG, report, STADIA_USB_INPUT_LEN, ESP_LOG_INFO);
+                #endif
+                have_report = false;
+            } else if (res == -1) {
+                have_report = false;
+                vTaskDelay(pdMS_TO_TICKS(10));
+            } else {
+                #if DONGLE_DEBUG
+                ESP_LOGW(TAG, "EP busy, retrying");
+                #endif
+                vTaskDelay(pdMS_TO_TICKS(2));
+            }
         }
     }
 }
@@ -158,20 +188,22 @@ void usb_stadia_init(void)
         .event_arg = NULL,
     };
     ESP_ERROR_CHECK(tinyusb_driver_install(&cfg));
+    tud_disconnect();
     s_usb_attached = false;
-    ESP_LOGI(TAG, "Stadia USB HID initialised (VID=18D1 PID=9400)");
+    ESP_LOGI(TAG, "Stadia USB HID initialised detached (VID=18D1 PID=9400)");
 }
 
 void usb_stadia_set_connected(bool connected)
 {
-    if (connected == s_usb_attached) return;
     if (connected) {
+        /* Connect immediately — safe from any task */
+        s_disconnect_pending = false;
         tud_connect();
         s_usb_attached = true;
         ESP_LOGI(TAG, "USB Stadia device attached");
     } else {
-        tud_disconnect();
-        s_usb_attached = false;
-        ESP_LOGI(TAG, "USB Stadia device detached");
+        /* Defer disconnect to the USB task — avoids cross-core race
+         * with an in-progress IN transfer on the USB core. */
+        s_disconnect_pending = true;
     }
 }

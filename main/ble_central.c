@@ -14,6 +14,7 @@
  *   7. On BLE_GAP_EVENT_NOTIFY_RX: translate → push to ble_to_usb_queue
  *   8. Rumble: ble_npl_callout → ble_gattc_write_flat (Write-With-Response)
  *   9. On disconnect: 1 s esp_timer → restart scan
+ *  10. Keep-alive: periodic GATT read of CCCD to verify HID service is alive
  *
  * Pairing: Just Works, bonding, Secure Connections (no MITM).
  * Bonds are persisted via CONFIG_BT_NIMBLE_NVS_PERSIST=y.
@@ -63,8 +64,8 @@ static struct {
 
 static int      s_chr_count   = 0;
 static int      s_cur_chr     = 0;
-static uint16_t s_cur_2908    = 0; // Report Reference descriptor handle for current chr
-static uint16_t s_cur_2902    = 0; // CCCD handle for current chr
+static uint16_t s_cur_2908    = 0;
+static uint16_t s_cur_2902    = 0;
 
 /* ---- Rumble callout (must execute on NimBLE event queue) ----------------- */
 
@@ -74,6 +75,15 @@ static uint8_t                s_rumble_payload[4];
 /* ---- Reconnect timer ----------------------------------------------------- */
 
 static esp_timer_handle_t s_reconnect_timer;
+
+/* ---- Keep-alive timer --------------------------------------------------- */
+static esp_timer_handle_t s_keepalive_timer;
+#define KEEPALIVE_INTERVAL_S 5
+
+static void start_keepalive(void);
+static void stop_keepalive(void);
+static int  keepalive_read_cb(uint16_t conn_handle, const struct ble_gatt_error *err,
+                               struct ble_gatt_attr *attr, void *arg);
 
 /* ---- Forward declarations ------------------------------------------------ */
 
@@ -106,20 +116,17 @@ static void on_sync(void)
 
 static void start_scan(void)
 {
-    // Cancel any ongoing scan first — safe no-op if not scanning.
     ble_gap_disc_cancel();
 
     uint8_t own_addr_type;
     ble_hs_id_infer_auto(0, &own_addr_type);
 
     struct ble_gap_disc_params params = {
-        .passive           = 0, // active scan to get scan-response (name)
-        .filter_duplicates = 0, // must be 0: directed adv (no name) would poison the
-                                // hardware filter and suppress the subsequent general adv
+        .passive           = 0,
+        .filter_duplicates = 0,
     };
     int rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &params, gap_event_fn, NULL);
     if (rc != 0) {
-        // Stack may still be busy (e.g. terminate not yet complete) — retry in 1 s.
         ESP_LOGE(TAG, "ble_gap_disc failed: %d — retrying in 1 s", rc);
         esp_timer_start_once(s_reconnect_timer, 1000000);
     } else {
@@ -186,7 +193,7 @@ static int svc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
     return 0;
 }
 
-/* Step 2: characteristic discovery — collect all 0x2A4D (Report) chars */
+/* Step 2: characteristic discovery */
 static int chr_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
                         const struct ble_gatt_chr *chr, void *arg)
 {
@@ -210,15 +217,9 @@ static int chr_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
     return 0;
 }
 
-/*
- * process_next_chr — iterate through collected 0x2A4D characteristics.
- * For each, discover its descriptors to find 0x2908 (Report Reference) and
- * 0x2902 (CCCD), then read the report reference to identify input vs output.
- */
 static void process_next_chr(void)
 {
     if (s_cur_chr >= s_chr_count) {
-        // All characteristics processed
         if (g_input_val_handle == 0 || g_output_val_handle == 0 ||
             g_input_cccd_handle == 0) {
             ESP_LOGE(TAG,
@@ -231,7 +232,6 @@ static void process_next_chr(void)
         return;
     }
 
-    // Descriptor range: [val_handle+1 … next chr def_handle−1] or svc end
     uint16_t start = s_chrs[s_cur_chr].val_handle + 1;
     uint16_t end   = (s_cur_chr + 1 < s_chr_count)
                         ? (s_chrs[s_cur_chr + 1].def_handle - 1)
@@ -249,7 +249,7 @@ static void process_next_chr(void)
                              dsc_disc_fn, NULL);
 }
 
-/* Step 3: descriptor discovery per characteristic */
+/* Step 3: descriptor discovery */
 static int dsc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
                         uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
 {
@@ -275,7 +275,7 @@ static int dsc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
     return 0;
 }
 
-/* Step 4: read Report Reference (0x2908) → identify input / output chr */
+/* Step 4: read Report Reference */
 static int report_ref_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
                           struct ble_gatt_attr *attr, void *arg)
 {
@@ -287,10 +287,10 @@ static int report_ref_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
             uint8_t report_type = buf[1];
             ESP_LOGI(TAG, "chr[%d] val=0x%04x id=%d type=%d",
                      s_cur_chr, s_chrs[s_cur_chr].val_handle, report_id, report_type);
-            if (report_type == 1) { // Input
+            if (report_type == 1) {
                 g_input_val_handle  = s_chrs[s_cur_chr].val_handle;
                 g_input_cccd_handle = s_cur_2902;
-            } else if (report_type == 2) { // Output
+            } else if (report_type == 2) {
                 g_output_val_handle = s_chrs[s_cur_chr].val_handle;
             }
         }
@@ -300,18 +300,12 @@ static int report_ref_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
     return 0;
 }
 
-/* Step 5: initiate encryption — CCCD write happens in BLE_GAP_EVENT_ENC_CHANGE */
+/* Step 5: encryption → CCCD write */
 static void subscribe(void)
 {
     ESP_LOGI(TAG, "Initiating encryption before CCCD write: val=0x%04x cccd=0x%04x out=0x%04x",
              g_input_val_handle, g_input_cccd_handle, g_output_val_handle);
 
-    // Stadia requires an encrypted link before accepting CCCD writes.
-    // Three cases for ble_gap_security_initiate():
-    //   rc == 0            → encryption in progress, write CCCD in BLE_GAP_EVENT_ENC_CHANGE
-    //   rc == BLE_HS_EALREADY → already encrypted (bond restored before discovery finished),
-    //                           ENC_CHANGE already fired so write CCCD now
-    //   rc == other        → unexpected failure, try CCCD anyway
     int rc = ble_gap_security_initiate(g_conn_handle);
     if (rc == 0) {
         ESP_LOGI(TAG, "Encryption in progress — CCCD write deferred to ENC_CHANGE");
@@ -333,6 +327,7 @@ static int cccd_write_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
     if (err->status == 0) {
         ESP_LOGI(TAG, "Notifications enabled — controller ready");
         usb_stadia_set_connected(true);
+        start_keepalive();
         start_battery_discovery();
     } else {
         ESP_LOGE(TAG, "CCCD write failed: %d — forcing reconnect", err->status);
@@ -367,20 +362,17 @@ static int battery_svc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error
             bridge_clear_battery_level();
             return 0;
         }
-
         ESP_LOGI(TAG, "Battery service: 0x%04x-0x%04x",
                  g_battery_svc_start, g_battery_svc_end);
         ble_gattc_disc_all_chrs(conn_handle, g_battery_svc_start,
                                 g_battery_svc_end, battery_chr_disc_fn, NULL);
         return 0;
     }
-
     if (err->status != 0) {
         ESP_LOGW(TAG, "Battery service discovery error: %d", err->status);
         bridge_clear_battery_level();
         return 0;
     }
-
     g_battery_svc_start = svc->start_handle;
     g_battery_svc_end = svc->end_handle;
     return 0;
@@ -395,17 +387,14 @@ static int battery_chr_disc_fn(uint16_t conn_handle, const struct ble_gatt_error
             bridge_clear_battery_level();
             return 0;
         }
-
         ble_gattc_read(conn_handle, g_battery_val_handle, battery_read_fn, NULL);
         return 0;
     }
-
     if (err->status != 0) {
         ESP_LOGW(TAG, "Battery characteristic discovery error: %d", err->status);
         bridge_clear_battery_level();
         return 0;
     }
-
     if (chr->uuid.u.type == BLE_UUID_TYPE_16 && chr->uuid.u16.value == 0x2A19) {
         g_battery_val_handle = chr->val_handle;
     }
@@ -424,12 +413,10 @@ static int battery_dsc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error
         }
         return 0;
     }
-
     if (err->status != 0) {
         ESP_LOGW(TAG, "Battery descriptor discovery error: %d", err->status);
         return 0;
     }
-
     if (dsc->uuid.u.type == BLE_UUID_TYPE_16 && dsc->uuid.u16.value == 0x2902) {
         g_battery_cccd_handle = dsc->handle;
     }
@@ -444,7 +431,6 @@ static int battery_read_fn(uint16_t conn_handle, const struct ble_gatt_error *er
         bridge_clear_battery_level();
         return 0;
     }
-
     uint8_t level = 0xFF;
     uint16_t len = 0;
     if (ble_hs_mbuf_to_flat(attr->om, &level, sizeof(level), &len) == 0 && len == 1) {
@@ -454,7 +440,6 @@ static int battery_read_fn(uint16_t conn_handle, const struct ble_gatt_error *er
         ESP_LOGW(TAG, "Battery read malformed");
         bridge_clear_battery_level();
     }
-
     uint16_t dsc_start = g_battery_val_handle + 1;
     if (dsc_start <= g_battery_svc_end) {
         ble_gattc_disc_all_dscs(conn_handle, g_battery_val_handle,
@@ -479,7 +464,6 @@ static int battery_cccd_write_fn(uint16_t conn_handle, const struct ble_gatt_err
 static void rumble_callout_fn(struct ble_npl_event *ev)
 {
     if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE || g_output_val_handle == 0) return;
-    // Write-With-Response (not _no_rsp) — Stadia requires acknowledgement
     ble_gattc_write_flat(g_conn_handle, g_output_val_handle,
                          s_rumble_payload, 4, NULL, NULL);
 }
@@ -497,10 +481,6 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
     switch (event->type) {
 
     case BLE_GAP_EVENT_DISC: {
-        // Connect if the advertisement contains "Stadia" (name match, used for first
-        // pairing or pairing-mode reconnect), if it is directed advertising, or if it
-        // comes from a previously bonded device — the controller advertises with empty
-        // payload while its stack initialises, so we must not wait for the name.
         bool is_directed = (event->disc.event_type == BLE_HCI_ADV_RPT_EVTYPE_DIR_IND);
         bool is_stadia   = adv_contains_stadia(event->disc.data, event->disc.length_data);
         bool is_bonded   = false;
@@ -514,14 +494,13 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
                      is_directed ? "directed adv" : is_bonded ? "bonded addr" : "name match");
             ble_gap_disc_cancel();
 
-            // Request a fast connection interval suitable for a gamepad (~10 ms).
             static const struct ble_gap_conn_params conn_params = {
-                .scan_itvl      = 16,  // 10 ms
-                .scan_window    = 16,  // 10 ms
-                .itvl_min       = 6,   // 7.5 ms (units of 1.25 ms) — BLE minimum, ~133 Hz
-                .itvl_max       = 6,   // 7.5 ms
+                .scan_itvl      = 16,
+                .scan_window    = 16,
+                .itvl_min       = 6,
+                .itvl_max       = 6,
                 .latency        = 0,
-                .supervision_timeout = 200, // 2 s
+                .supervision_timeout = 100,
                 .min_ce_len     = 0,
                 .max_ce_len     = 0,
             };
@@ -564,11 +543,14 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         g_battery_val_handle = 0;
         g_battery_cccd_handle = 0;
-        usb_stadia_set_connected(false);
+
+        stop_keepalive();
         bridge_clear_battery_level();
-        bridge_send_neutral(); // release all buttons/axes on the USB host side
-        esp_timer_stop(s_reconnect_timer); // no-op if not running; prevents INVALID_STATE
-        esp_timer_start_once(s_reconnect_timer, 1000000 /* 1 s in µs */);
+        bridge_send_neutral();
+        usb_stadia_set_connected(false);
+
+        esp_timer_stop(s_reconnect_timer);
+        esp_timer_start_once(s_reconnect_timer, 1000000);
         break;
 
     case BLE_GAP_EVENT_NOTIFY_RX: {
@@ -593,7 +575,6 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
         ESP_LOG_BUFFER_HEX_LEVEL(TAG, raw, len, ESP_LOG_INFO);
         #endif
 
-        // Stadia BLE sends the 10-byte report payload without Report ID 0x03.
         if (len < 9) {
             ESP_LOGW(TAG, "HID report too short: len=%d", len);
             break;
@@ -613,7 +594,6 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "Encryption status: %d", event->enc_change.status);
         if (event->enc_change.status == 0) {
             if (g_input_cccd_handle != 0) {
-                // Link is now encrypted — safe to enable notifications
                 uint8_t val[2] = {0x01, 0x00};
                 ble_gattc_write_flat(event->enc_change.conn_handle, g_input_cccd_handle,
                                      val, sizeof(val), cccd_write_fn, NULL);
@@ -630,6 +610,48 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
     return 0;
 }
 
+/* ---- Keep-alive: periodic CCCD read to verify HID service is alive ------- */
+
+static void keepalive_timer_cb(void *arg)
+{
+    if (g_input_cccd_handle == 0 || g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+    ble_gattc_read(g_conn_handle, g_input_cccd_handle,
+                   keepalive_read_cb, NULL);
+}
+
+static int keepalive_read_cb(uint16_t conn_handle, const struct ble_gatt_error *err,
+                              struct ble_gatt_attr *attr, void *arg)
+{
+    if (err->status == 0) {
+        /* Controller still responding — restart timer */
+        esp_timer_start_once(s_keepalive_timer, KEEPALIVE_INTERVAL_S * 1000000);
+    } else {
+        /* HID service not reachable → force BLE disconnect */
+        ESP_LOGW(TAG, "Keep-alive read failed (status=%d) — forcing disconnect", err->status);
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+    return 0;
+}
+
+static void start_keepalive(void)
+{
+    if (s_keepalive_timer == NULL) {
+        esp_timer_create_args_t ta = {
+            .callback = keepalive_timer_cb,
+            .name     = "ble_keepalive",
+        };
+        esp_timer_create(&ta, &s_keepalive_timer);
+    }
+    esp_timer_start_once(s_keepalive_timer, KEEPALIVE_INTERVAL_S * 1000000);
+}
+
+static void stop_keepalive(void)
+{
+    if (s_keepalive_timer) {
+        esp_timer_stop(s_keepalive_timer);
+    }
+}
+
 /* ---- NimBLE host task ---------------------------------------------------- */
 
 void nimble_host_task(void *param)
@@ -642,23 +664,20 @@ void nimble_host_task(void *param)
 
 void ble_central_init(void)
 {
-    // Reconnect timer
     esp_timer_create_args_t ta = {
         .callback = reconnect_timer_cb,
         .name     = "ble_reconnect",
     };
     ESP_ERROR_CHECK(esp_timer_create(&ta, &s_reconnect_timer));
 
-    // Rumble callout (executes on NimBLE's default event queue)
     ble_npl_callout_init(&s_rumble_callout,
                          nimble_port_get_dflt_eventq(),
                          rumble_callout_fn, NULL);
 
-    // NimBLE host configuration
     ble_hs_cfg.reset_cb  = on_reset;
     ble_hs_cfg.sync_cb   = on_sync;
-    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO; // Just Works
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
     ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_mitm    = 0;
-    ble_hs_cfg.sm_sc      = 1; // Secure Connections
+    ble_hs_cfg.sm_sc      = 1;
 }
