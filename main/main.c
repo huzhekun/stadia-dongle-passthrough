@@ -5,7 +5,7 @@
  *   Core 0, pri 5 - nimble_host_task    (NimBLE host stack)
  *   Core 0, pri 3 - ble_rumble_task     (drain usb_to_ble -> BLE rumble)
  *   Core 1, pri 4 - tinyusb device task (created by tinyusb_driver_install)
- *   Core 1, pri 4 - usb_stadia_task     (drain ble_to_usb -> Stadia HID)
+ *   Core 1, pri 4 - usb_stadia_task / usb_xbox_task (drain ble_to_usb -> USB)
  */
 
 #include "freertos/FreeRTOS.h"
@@ -17,8 +17,13 @@
 #include "nimble/nimble_port_freertos.h"
 
 #include "bridge.h"
-#include "usb_stadia.h"
 #include "ble_central.h"
+
+#if STADIA_EMULATE_XBOX360
+#include "usb_xbox.h"
+#else
+#include "usb_stadia.h"
+#endif
 
 static const char *TAG = "MAIN";
 
@@ -72,7 +77,11 @@ void app_main(void)
     bridge_init();
 
     // USB: install TinyUSB driver (also starts the USB device task on Core 1)
+#if STADIA_EMULATE_XBOX360
+    usb_xbox_init();
+#else
     usb_stadia_init();
+#endif
 
     // Initialise NimBLE port before ble_central_init(), so the default event
     // queue exists before we attach BLE callouts to it.
@@ -80,10 +89,18 @@ void app_main(void)
 
     ble_central_init();
 
+#if STADIA_EMULATE_XBOX360
+    xTaskCreatePinnedToCore(usb_xbox_task, "usb_xbox", 4096, NULL, 4, NULL, 1);
+#else
     xTaskCreatePinnedToCore(usb_stadia_task, "usb_stadia", 4096, NULL, 4, NULL, 1);
+#endif
     xTaskCreatePinnedToCore(ble_rumble_task, "ble_rumble", 4096, NULL, 3, NULL, 0);
 
     nimble_port_freertos_init(nimble_host_task);
 
-    ESP_LOGI(TAG, "Stadia BT dongle started");
+#if STADIA_EMULATE_XBOX360
+    ESP_LOGI(TAG, "Stadia BT dongle started (Xbox 360 emulation)");
+#else
+    ESP_LOGI(TAG, "Stadia BT dongle started (Stadia HID)");
+#endif
 }

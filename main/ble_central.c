@@ -22,7 +22,14 @@
 
 #include "ble_central.h"
 #include "bridge.h"
+
+#if STADIA_EMULATE_XBOX360
+#include "usb_xbox.h"
+#define usb_set_connected usb_xbox_set_connected
+#else
 #include "usb_stadia.h"
+#define usb_set_connected usb_stadia_set_connected
+#endif
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -326,7 +333,7 @@ static int cccd_write_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
 {
     if (err->status == 0) {
         ESP_LOGI(TAG, "Notifications enabled — controller ready");
-        usb_stadia_set_connected(true);
+        usb_set_connected(true);
         start_keepalive();
         start_battery_discovery();
     } else {
@@ -547,7 +554,7 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
         stop_keepalive();
         bridge_clear_battery_level();
         bridge_send_neutral();
-        usb_stadia_set_connected(false);
+        usb_set_connected(false);
 
         esp_timer_stop(s_reconnect_timer);
         esp_timer_start_once(s_reconnect_timer, 1000000);
@@ -580,6 +587,15 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
             break;
         }
 
+#if STADIA_EMULATE_XBOX360
+        uint8_t xbox_report[20];
+        stadia_to_xbox360(raw, xbox_report);
+        if (xQueueSendToBack(ble_to_usb_queue, xbox_report, 0) != pdTRUE) {
+            uint8_t dummy[20];
+            xQueueReceive(ble_to_usb_queue, dummy, 0);
+            xQueueSendToBack(ble_to_usb_queue, xbox_report, 0);
+        }
+#else
         uint8_t stadia_usb[11];
         stadia_ble_to_usb_hid(raw, len, stadia_usb);
         if (xQueueSendToBack(ble_to_usb_queue, stadia_usb, 0) != pdTRUE) {
@@ -587,6 +603,7 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
             xQueueReceive(ble_to_usb_queue, dummy, 0);
             xQueueSendToBack(ble_to_usb_queue, stadia_usb, 0);
         }
+#endif
         break;
     }
 
