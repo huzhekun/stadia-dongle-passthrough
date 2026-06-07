@@ -19,7 +19,7 @@
 #include "bridge.h"
 #include "ble_central.h"
 
-#if STADIA_EMULATE_XBOX360
+#if STADIA_EMULATE_XINPUT
 #include "usb_xbox.h"
 #else
 #include "usb_stadia.h"
@@ -77,7 +77,7 @@ void app_main(void)
     bridge_init();
 
     // USB: install TinyUSB driver (also starts the USB device task on Core 1)
-#if STADIA_EMULATE_XBOX360
+#if STADIA_EMULATE_XINPUT
     usb_xbox_init();
 #else
     usb_stadia_init();
@@ -89,7 +89,7 @@ void app_main(void)
 
     ble_central_init();
 
-#if STADIA_EMULATE_XBOX360
+#if STADIA_EMULATE_XINPUT
     xTaskCreatePinnedToCore(usb_xbox_task, "usb_xbox", 4096, NULL, 4, NULL, 1);
 #else
     xTaskCreatePinnedToCore(usb_stadia_task, "usb_stadia", 4096, NULL, 4, NULL, 1);
@@ -98,8 +98,8 @@ void app_main(void)
 
     nimble_port_freertos_init(nimble_host_task);
 
-#if STADIA_EMULATE_XBOX360
-    ESP_LOGI(TAG, "Stadia BT dongle started (Xbox 360 emulation)");
+#if STADIA_EMULATE_XINPUT
+    ESP_LOGI(TAG, "Stadia BT dongle started (XInput HID emulation)");
 #else
     ESP_LOGI(TAG, "Stadia BT dongle started (Stadia HID)");
 #endif

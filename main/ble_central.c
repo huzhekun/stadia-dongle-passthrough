@@ -23,7 +23,7 @@
 #include "ble_central.h"
 #include "bridge.h"
 
-#if STADIA_EMULATE_XBOX360
+#if STADIA_EMULATE_XINPUT
 #include "usb_xbox.h"
 #define usb_set_connected usb_xbox_set_connected
 #else
@@ -587,13 +587,13 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
             break;
         }
 
-#if STADIA_EMULATE_XBOX360
-        uint8_t xbox_report[20];
-        stadia_to_xbox360(raw, xbox_report);
-        if (xQueueSendToBack(ble_to_usb_queue, xbox_report, 0) != pdTRUE) {
-            uint8_t dummy[20];
+#if STADIA_EMULATE_XINPUT
+        uint8_t xinput_report[32];
+        stadia_to_xinputhid(raw, xinput_report);
+        if (xQueueSendToBack(ble_to_usb_queue, xinput_report, 0) != pdTRUE) {
+            uint8_t dummy[32];
             xQueueReceive(ble_to_usb_queue, dummy, 0);
-            xQueueSendToBack(ble_to_usb_queue, xbox_report, 0);
+            xQueueSendToBack(ble_to_usb_queue, xinput_report, 0);
         }
 #else
         uint8_t stadia_usb[11];

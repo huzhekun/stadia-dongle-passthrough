@@ -1,9 +1,9 @@
 /*
  * bridge.c — Translation between Stadia BLE input reports and USB reports.
  *
- * Supports two output modes controlled by STADIA_EMULATE_XBOX360:
- *   Stadia  HID (0): 11-byte Stadia USB HID report (Report ID 0x03)
- *   Xbox 360     (1): 20-byte Xbox 360 input report (vendor-specific)
+ * Supports two output modes controlled by STADIA_EMULATE_XINPUT:
+ *   0: Stadia HID  (11-byte Stadia USB HID report, Report ID 0x03)
+ *   1: XInputHID   (18-byte standard HID report, VID 045E PID 02FF)
  *
  * Stadia BLE notification payload (10 bytes, no Report ID):
  *   [0] D-pad hat (0=Up … 7=Up-L, >7=neutral)
@@ -35,23 +35,18 @@ void bridge_init(void)
     battery_to_usb_queue = xQueueCreate(2, BATTERY_ITEM_SIZE);
 }
 
-/* ---- Stadia HID mode --------------------------------------------------- */
-
 void bridge_send_neutral(void)
 {
-#if STADIA_EMULATE_XBOX360
-    uint8_t neutral[20] = {
-        0x00, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-    };
+#if STADIA_EMULATE_XINPUT
+    uint8_t neutral[32] = {0};
+    neutral[0] = 0xFF; neutral[1] = 0x7F; // X = 32767
+    neutral[2] = 0xFF; neutral[3] = 0x7F; // Y = 32767
+    neutral[4] = 0xFF; neutral[5] = 0x7F; // Rx = 32767
+    neutral[6] = 0xFF; neutral[7] = 0x7F; // Ry = 32767
 #else
     uint8_t neutral[11] = {
         STADIA_INPUT_REPORT_ID,
-        0x08,             // neutral hat
-        0x00, 0x00,       // buttons
-        0x80, 0x80,       // left stick center
-        0x80, 0x80,       // right stick center
-        0x00, 0x00,       // triggers
-        0x00,             // consumer/system buttons
+        0x08, 0x00, 0x00, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00
     };
 #endif
     xQueueReset(ble_to_usb_queue);
@@ -63,9 +58,7 @@ void stadia_ble_to_usb_hid(const uint8_t *stadia_ble, uint16_t len, uint8_t *sta
     uint8_t neutral_payload[STADIA_BLE_INPUT_LEN] = {
         0x08, 0x00, 0x00, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00
     };
-
     stadia_usb[0] = STADIA_INPUT_REPORT_ID;
-
     if (len >= STADIA_BLE_INPUT_LEN) {
         memcpy(&stadia_usb[1], stadia_ble, STADIA_BLE_INPUT_LEN);
     } else {
@@ -74,74 +67,72 @@ void stadia_ble_to_usb_hid(const uint8_t *stadia_ble, uint16_t len, uint8_t *sta
     }
 }
 
-#if STADIA_EMULATE_XBOX360
+#if STADIA_EMULATE_XINPUT
 
-/* ---- Xbox 360 mode ----------------------------------------------------- */
+/* ---- XInputHID mode (Xbox Series Bluetooth HID) ------------------------ */
 
-/* Stadia hat-switch (0–7) → Xbox 360 d-pad bitmask
- * bits 0=Up, 1=Down, 2=Left, 3=Right */
-static const uint8_t dpad_map[8] = {
-    0x01, // Up
-    0x09, // Up+Right
-    0x08, // Right
-    0x0A, // Down+Right
-    0x02, // Down
-    0x06, // Down+Left
-    0x04, // Left
-    0x05, // Up+Left
+static const uint8_t dpad_map_xh[8] = {
+    1, 2, 3, 4, 5, 6, 7, 8  // Up, Up-Right, Right, Down-Right, Down, Down-Left, Left, Up-Left
 };
 
-/* Map 0–255 unsigned stick value to -32767..+32767 signed, optionally inverting axis.
- * Center dead-zone: raw 128 → 0, raw 0/255 → ±32767. */
-static int16_t map_stick(uint8_t v, int invert)
+void stadia_to_xinputhid(const uint8_t *s, uint8_t *x)
 {
-    int c = (int)v - 128;
-    if (c < -127) c = -127;
-    if (invert) c = -c;
-    return (int16_t)(32767 * c / 127);
+    memset(x, 0, 18);
+
+    // 16-bit sticks: map 0-255 (unsigned) to 0-65534 (center=32767)
+    int lx_i = (int)s[3] * 65534 / 255;
+    int ly_i = (int)(255 - s[4]) * 65534 / 255; // invert Y
+    int rx_i = (int)s[5] * 65534 / 255;
+    int ry_i = (int)(255 - s[6]) * 65534 / 255; // invert Y
+
+    x[0] = (uint8_t)(lx_i & 0xFF);
+    x[1] = (uint8_t)(lx_i >> 8);
+    x[2] = (uint8_t)(ly_i & 0xFF);
+    x[3] = (uint8_t)(ly_i >> 8);
+    x[4] = (uint8_t)(rx_i & 0xFF);
+    x[5] = (uint8_t)(rx_i >> 8);
+    x[6] = (uint8_t)(ry_i & 0xFF);
+    x[7] = (uint8_t)(ry_i >> 8);
+
+    // 10-bit triggers: Stadia 0-255 → XInputHID 0-1023
+    int lt_i = (int)s[7] * 1023 / 255;
+    int rt_i = (int)s[8] * 1023 / 255;
+    x[8]  = (uint8_t)(lt_i & 0xFF);
+    x[9]  = (uint8_t)((lt_i >> 8) & 0x03);
+    x[10] = (uint8_t)(rt_i & 0xFF);
+    x[11] = (uint8_t)((rt_i >> 8) & 0x03);
+
+    // Buttons: 16 bits
+    uint16_t btns = 0;
+    if (s[2] & (1 << 6)) btns |= (1 << 0);  // A
+    if (s[2] & (1 << 5)) btns |= (1 << 1);  // B
+    if (s[2] & (1 << 4)) btns |= (1 << 2);  // X
+    if (s[2] & (1 << 3)) btns |= (1 << 3);  // Y
+    if (s[2] & (1 << 2)) btns |= (1 << 4);  // LB
+    if (s[2] & (1 << 1)) btns |= (1 << 5);  // RB
+    if (s[2] & (1 << 0)) btns |= (1 << 6);  // LS click
+    if (s[1] & (1 << 7)) btns |= (1 << 7);  // RS click
+    if (s[1] & (1 << 5)) btns |= (1 << 8);  // MENU → Start
+    if (s[1] & (1 << 6)) btns |= (1 << 9);  // OPTIONS → Back
+    if (s[1] & (1 << 4)) btns |= (1 << 10); // STADIA_BTN → extra button 11
+    x[12] = (uint8_t)(btns & 0xFF);
+    x[13] = (uint8_t)(btns >> 8);
+
+    // Hat switch
+    if (s[0] < 8) {
+        x[14] = dpad_map_xh[s[0]];
+    } else {
+        x[14] = 0;
+    }
+
+    // Record (Share) — 0 for now
+    x[15] = 0;
+
+    // Battery = unknown until BLE reports
+    x[17] = 0xFF;
 }
 
-void stadia_to_xbox360(const uint8_t *s, uint8_t *x)
-{
-    memset(x, 0, 20);
-    x[0] = 0x00; // packet type
-    x[1] = 0x14; // packet length = 20
-
-    // Byte 2: d-pad + Start / Back / LS / RS
-    uint8_t b2 = (s[0] < 8) ? dpad_map[s[0]] : 0;
-    if (s[1] & (1 << 5)) b2 |= (1 << 4); // MENU    → Start
-    if (s[1] & (1 << 6)) b2 |= (1 << 5); // OPTIONS → Back
-    if (s[2] & (1 << 0)) b2 |= (1 << 6); // LS
-    if (s[1] & (1 << 7)) b2 |= (1 << 7); // RS
-    x[2] = b2;
-
-    // Byte 3: LB / RB / Guide / A / B / X / Y
-    uint8_t b3 = 0;
-    if (s[2] & (1 << 2)) b3 |= (1 << 0); // LB
-    if (s[2] & (1 << 1)) b3 |= (1 << 1); // RB
-    if (s[1] & (1 << 4)) b3 |= (1 << 2); // STADIA_BTN → Guide
-    if (s[2] & (1 << 6)) b3 |= (1 << 4); // A
-    if (s[2] & (1 << 5)) b3 |= (1 << 5); // B
-    if (s[2] & (1 << 4)) b3 |= (1 << 6); // X
-    if (s[2] & (1 << 3)) b3 |= (1 << 7); // Y
-    x[3] = b3;
-
-    x[4] = s[7]; // left trigger
-    x[5] = s[8]; // right trigger
-
-    int16_t lx = map_stick(s[3], 0);
-    int16_t ly = map_stick(s[4], 1); // Stadia Y=0 is up → invert for Xbox (positive=up)
-    int16_t rx = map_stick(s[5], 0);
-    int16_t ry = map_stick(s[6], 1);
-
-    x[6]  = (uint8_t)(lx & 0xFF); x[7]  = (uint8_t)(lx >> 8);
-    x[8]  = (uint8_t)(ly & 0xFF); x[9]  = (uint8_t)(ly >> 8);
-    x[10] = (uint8_t)(rx & 0xFF); x[11] = (uint8_t)(rx >> 8);
-    x[12] = (uint8_t)(ry & 0xFF); x[13] = (uint8_t)(ry >> 8);
-    // bytes 14–19 already zero
-}
-
-#endif /* STADIA_EMULATE_XBOX360 */
+#endif /* STADIA_EMULATE_XINPUT */
 
 /* ---- Battery (shared between modes) ------------------------------------ */
 
